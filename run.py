@@ -3,25 +3,24 @@ import numpy as np
 from datetime import datetime
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection._split import check_cv
+import logging
+from sklearn.base import is_classifier
 
-logFormatter = logging.Formatter("[%(asctime)s] %(message)s", datefmt='%m/%d %I:%M:%S')
-
-rootLogger = logging.getLogger()
-rootLogger.setLevel(logging.DEBUG)
-
-if not rootLogger.handlers:
-    fileHandler = logging.FileHandler(datetime.now().strftime('PG_%d-%m_%H:%M.log'))
-    fileHandler.setFormatter(logFormatter)
-    rootLogger.addHandler(fileHandler)
+def log():
+    logFormatter = logging.Formatter("[%(asctime)s] %(message)s", datefmt='%m/%d %I:%M:%S')
+    rootLogger = logging.getLogger()
+    rootLogger.setLevel(logging.DEBUG)
 
     consoleHandler = logging.StreamHandler()
     consoleHandler.setFormatter(logFormatter)
     rootLogger.addHandler(consoleHandler)
+    return rootLogger
 
+rootLogger  = log()
 
 class ManualTunningException(Exception):
 
-    def __init__(self, message):\
+    def __init__(self, message):
         super(ManualTunningException, self).__init__()
         self.message = message
 
@@ -55,7 +54,7 @@ class ManualTunning():
     Example
     -------
     >>> param_dict = {'n_estimators': [10, 100], 'max_depth': [4, 6]}
-    >>> tunning = ManualTunningException(estimator, cv=3)
+    >>> tunning = ManualTunning(estimator, cv=3)
     >>> tunning.scores_ # The evaluated parameters, sorted by scoring
 
     Raises
@@ -89,7 +88,8 @@ class ManualTunning():
 
         self.combinations_ = [dict(zip(keys,p))
                              for p in [x for x in product(*(values))]]
-        rootLogger(f"Models to be trained: {len(self.combinations_)}")
+        
+        rootLogger.info(f"Models to be trained: {len(self.combinations_)}")
 
         module_name = self.estimator.__module__
         rootLogger.info(f"Estimator: {module_name}")
@@ -102,7 +102,7 @@ class ManualTunning():
             self._tune_generic(X,y)
 
         self.scores_ = [(k, self.evals_[k])
-                        for k in sorted(self.evals_, key=self.evals._get,
+                        for k in sorted(self.evals_, key=self.evals_.get,
                                         reverse=self.maximize)]
 
         result = self.scores_[0]
@@ -110,18 +110,18 @@ class ManualTunning():
         self.estimator.set_params(**dict(self.scores_[0][0]))
         rootLogger.info(f"Best: {best} - Score: {result[1]}")
 
-    def _get_cv(self, X, y):
+    def _get_cv(self, y):
 
-        cv = check_cv(self.cv, X, y, classifier=is_classifier(self.estimator))
+        cv = check_cv(self.cv, y, classifier=is_classifier(self.estimator))
         return cv
 
     def transform(self):
-        raise NotImplementdError
+        raise NotImplementedError('Error')
 
     def _tune_xgb(self, X, y):
 
         scores = dict()
-        cv = self._get_cv(X,y)
+        cv = self._get_cv(y)
 
         for i in self.combinations_:
             folds = []
@@ -129,28 +129,28 @@ class ManualTunning():
             for train_index, valid_index in cv.split(X,y):
 
                 train_x, valid_x = X.iloc[train_index], X.iloc[valid_index]
-                train_y, valid_y = y[train_index], y[valid_index]
+                train_y, valid_y = y.iloc[train_index], y.iloc[valid_index]
 
                 self.estimator.fit(
                     train_x, train_y,
-                    eval_set=[(valid_x, valid_y)],
-                    eval_metric=self.eval_metric_,
-                    early_stopping_rounds=self.early_stopping_rounds,
                     verbose=self.verbose_)
-                folds.append(self.estimator.best_score)
+
+                if self.eval_metric_ == 'auc':
+                    pred = self.estimator.predict_proba(valid_x)[:, 1]
+                    folds.append(roc_auc_score(valid_y, pred))
 
             rootLogger.info((
                     f"Parameter:{i} - Metric: {self.eval_metric_} - "
                     f"Value: {np.mean(folds)}"))
 
-            scores[frozenset(i.items()) = np.mean(folds)]
+            scores[frozenset(i.items())] = np.mean(folds)
         self.evals_ = scores  
 
 
     def _tune_lgb(self, X, y):
 
         scores = dict()
-        cv = self._get_cv(X,y)
+        cv = self._get_cv(y)
 
         for i in self.combinations_:
             folds = []
@@ -158,17 +158,16 @@ class ManualTunning():
             for train_index, valid_index in cv.split(X,y):
 
                 train_x, valid_x = X.iloc[train_index], X.iloc[valid_index]
-                train_y, valid_y = y[train_index], y[valid_index]
-
+                train_y, valid_y = y.iloc[train_index], y.iloc[valid_index]
+                
                 self.estimator.fit(
                     train_x, train_y,
-                    eval_set=[(valid_x, valid_y)],
-                    eval_metric=self.eval_metric_,
-                    early_stopping_rounds=self.early_stopping_rounds,
                     verbose=self.verbose_)
 
-                best_score = self.estimator.best_score_['valid_0']
-                folds.append(best_score[self.eval_metric_])
+                if self.eval_metric_ == 'auc':
+                    pred = self.estimator.predict_proba(valid_x)[:, 1]
+                    folds.append(roc_auc_score(valid_y, pred))
+
 
             rootLogger.info((
                             f"Parameter: {i} - "
@@ -182,7 +181,7 @@ class ManualTunning():
     def _tune_generic(self, X, y):
 
         scores = dict()
-        cv = self._get_cv(X,y)
+        cv = self._get_cv(y)
 
         for param in self.combinations_:
             folds = []
@@ -190,9 +189,9 @@ class ManualTunning():
             for train_index, test_index in cv.split(X,y):
 
                 train_x, valid_x = X.iloc[train_index], X.iloc[test_index]
-                train_y, valid_y = y[train_index], y[test_index]
+                train_y, valid_y = y.iloc[train_index], y.iloc[test_index]
 
-                self.estimator.fit(train_x, train_y, verbose=self.verbose_)
+                self.estimator.fit(train_x, train_y)
 
                 if self.eval_metric_ == 'auc':
                     pred = self.estimator.predict_proba(valid_x)[:, 1]
